@@ -85,6 +85,58 @@ uint16_t bf16_mul(uint16_t a, uint16_t b)
 
 uint16_t bf16_sqrt(uint16_t a)
 {
-    (void) a;
-    return 0;
+    int exp = (a >> 7) & 0xFF;
+    uint32_t frac = a & 0x7F;
+
+    /* NaN unchanged, -Inf gives NaN, +Inf unchanged. */
+    if (exp == 0xFF) {
+        if (frac != 0)
+            return a;
+        if (a & 0x8000)
+            return 0x7FC0;
+        return a;
+    }
+    if (exp == 0 && frac == 0) /* both zeros give +0 */
+        return 0;
+    if (a & 0x8000) /* negative nonzero */
+        return 0x7FC0;
+    if (exp == 0) /* denormals give +0 */
+        return 0;
+
+    /* sqrt(2^e * m) = 2^(e/2) * sqrt(m); an odd e lends a factor of two. */
+    int e = exp - 127;
+    uint32_t m = 0x80 | frac;
+    if (e & 1) {
+        m = m << 1;
+        e = e - 1;
+    }
+    int new_exp = e / 2 + 127;
+
+    /* Binary search for the largest mid with mid * mid / 128 <= m. */
+    uint32_t low = 90, high = 256, result = 128;
+    while (low <= high) {
+        uint32_t mid = (low + high) >> 1;
+        if ((mid * mid) / 128 <= m) {
+            result = mid;
+            low = mid + 1;
+        } else {
+            high = mid - 1;
+        }
+    }
+
+    /* Bring the result back into [128, 256). */
+    if (result >= 256) {
+        result >>= 1;
+        new_exp++;
+    } else {
+        while (result < 128 && new_exp > 1) {
+            result <<= 1;
+            new_exp--;
+        }
+    }
+    if (new_exp >= 0xFF)
+        return 0x7F80;
+    if (new_exp <= 0)
+        return 0;
+    return (new_exp << 7) | (result & 0x7F);
 }
