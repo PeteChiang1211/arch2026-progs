@@ -11,7 +11,10 @@ Repository: [PeteChiang1211/arch2026-progs](https://github.com/PeteChiang1211/ar
 | 2026-10-31 | setup | Forked the framework, installed the xPack toolchain, built rv32emu | `make toolchain` passes, skeleton scores 0 | — |
 | 2026-10-31 | gcd | C version of the binary GCD | all C tests pass, worst call 399 instructions at `-O2` (budget 4,000) | [`bd483ec`](https://github.com/PeteChiang1211/arch2026-progs/commit/bd483ec137608a109433bb72df4aaee5836a89f6) |
 | 2026-10-31 | gcd | RV32I assembly version | 84.4 instructions per call, 1.17x the best C build; gcd passes, total 25/100 | [`5b823a4`](https://github.com/PeteChiang1211/arch2026-progs/commit/5b823a401464e32a6507b22279481cbbee1ada75) |
-| | fixed | | | |
+| 2026-11-01 | fixed | C bitwise add (`op1`) and subtraction (`op2`) | tests pass, worst `op1` call 169 instructions (budget 1,500) | [`96805ab`](https://github.com/PeteChiang1211/arch2026-progs/commit/96805ab5b1138ea8f3411897b6a11b8e365d44f9) |
+| 2026-11-01 | fixed | C overflow-free average (`op3`) | tests pass, 11 instructions (budget 150) | [`f2c469a`](https://github.com/PeteChiang1211/arch2026-progs/commit/f2c469a08ccbc3149ae1af5877026e2220b991ee) |
+| 2026-11-01 | fixed | C Q11.20 multiply from 16-bit partial products | all C tests pass, worst call 525 instructions (budget 3,000) | [`38d99b6`](https://github.com/PeteChiang1211/arch2026-progs/commit/38d99b69a842d897cd087658d0a8c1e9d8601cd5) |
+| 2026-11-01 | fixed | RV32I assembly of all four functions | `q_mul` 1.73x, `op3` 1.29x the best C build; fixed passes, total 50/100 | [`2b37892`](https://github.com/PeteChiang1211/arch2026-progs/commit/2b37892bfd17f9d11355b79d7571f58d3afb6fae) |
 | | bf16 | | | |
 | | rubik | | | |
 
@@ -138,7 +141,68 @@ The assembly is the fastest and the largest: the duplicated subtract loop trades
 
 ## fixed: Bitwise adders and Q11.20 fixed-point multiply
 
-> TODO
+Contract: [`src/fixed/fixed.h`](https://github.com/PeteChiang1211/arch2026-progs/blob/2b37892bfd17f9d11355b79d7571f58d3afb6fae/src/fixed/fixed.h). C version: [`src/fixed/fixed.c`](https://github.com/PeteChiang1211/arch2026-progs/blob/2b37892bfd17f9d11355b79d7571f58d3afb6fae/src/fixed/fixed.c). Assembly: [`src/fixed/fixed.S`](https://github.com/PeteChiang1211/arch2026-progs/blob/2b37892bfd17f9d11355b79d7571f58d3afb6fae/src/fixed/fixed.S).
+
+### op1: addition from logic
+
+Adding two bits gives a sum bit and a carry bit:
+
+| x | y | sum | carry |
+|---|---|---|---|
+| 0 | 0 | 0 | 0 |
+| 0 | 1 | 1 | 0 |
+| 1 | 0 | 1 | 0 |
+| 1 | 1 | 0 | 1 |
+
+The sum column is XOR, the carry column is AND, and a carry belongs one position to the left. So a + b = (a ^ b) + ((a & b) << 1): one pass turns (a, b) into (partial sum, carries), and the loop repeats until no carry is left. This is how an adder is built from gates. Example, 5 + 3: (101, 011) → (110, 010) → (100, 100) → (000, 1000) → (1000, 0), four passes.
+
+```c
+    while (b != 0) {
+        uint32_t c = (a & b) << 1;
+        a = a ^ b;
+        b = c;
+        count = count + 1;
+    }
+```
+
+### op2: subtraction
+
+The quiz builds a − b from op1 as a + ~b + 1, but the budget of 40 instructions asks for the plain `sub`.
+
+### op3: average without overflow
+
+(a + b) / 2 overflows when a + b ≥ 2^32 even though the average fits. Halving first, a/2 + b/2 loses exactly 1 when both operands are odd (two discarded halves), so the C version is
+
+```c
+    return (a >> 1) + (b >> 1) + (a & b & 1);
+```
+
+The assembly uses the identity from op1 instead, a + b = 2(a & b) + (a ^ b), so floor((a + b) / 2) = (a & b) + ((a ^ b) >> 1): four instructions instead of five.
+
+### q_mul: Q11.20 multiply
+
+A stored value A represents A / 2^20. Multiplying two stored values scales the product by 2^40, one factor of 2^20 too many, so the product is shifted right by 20 after adding 2^19 (half a unit) to round, ties toward plus infinity.
+
+The product needs 64 bits (2.0 × 2.0 is 2^21 × 2^21 = 2^42), and GCC lowers a 64-bit multiply to `__muldi3`, which the runtime does not supply. The C version takes the magnitudes, splits each into 16-bit halves and adds the four partial products with shifts, like long multiplication with two-digit groups: (ah·2^16 + al)(bh·2^16 + bl) = ah·bh·2^32 + (ah·bl + al·bh)·2^16 + al·bl. Each partial product fits in 32 bits.
+
+The assembly replaces the four `__mulsi3` calls with one shift-and-add loop over the bits of the smaller magnitude, adding the 64-bit multiplicand (a register pair) to the 64-bit accumulator with an explicit carry (`sltu`). The loop stops when the multiplier has no set bits left.
+
+### Results
+
+Instructions per call (`make cycles`):
+
+| Function | -O1 | -O2 | -O3 | -Os | asm | speedup |
+|---|---|---|---|---|---|---|
+| op1 | 24.8 | 22.1 | 24.2 | 24.7 | 22.1 | 1.00x |
+| op2 | 4.0 | 4.0 | 5.9 | 4.0 | 4.0 | 1.00x |
+| op3 | 9.0 | 9.0 | 10.9 | 9.0 | 7.0 | 1.29x |
+| q_mul | 323.2 | 321.8 | 323.7 | 324.8 | 185.9 | 1.73x |
+
+Worst calls (assembly / best C / assembly budget): op1 169 / 169 / 600, op3 9 / 11 / 40, q_mul 404 / 522 / 1,200.
+
+Footprint `.text` (bytes): -O1 380, -O2 360, -O3 360, -Os 372, asm 224.
+
+> TODO: why op1 and op2 cannot beat the compiler; error analysis of Q11.20 (resolution 2^-20, range [-2048, 2048)); real-world uses of fixed point.
 
 ## bf16: BFloat16
 
