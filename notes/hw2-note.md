@@ -15,7 +15,10 @@ Repository: [PeteChiang1211/arch2026-progs](https://github.com/PeteChiang1211/ar
 | 2026-11-01 | fixed | C overflow-free average (`op3`) | tests pass, 11 instructions (budget 150) | [`f2c469a`](https://github.com/PeteChiang1211/arch2026-progs/commit/f2c469a08ccbc3149ae1af5877026e2220b991ee) |
 | 2026-11-01 | fixed | C Q11.20 multiply from 16-bit partial products | all C tests pass, worst call 525 instructions (budget 3,000) | [`38d99b6`](https://github.com/PeteChiang1211/arch2026-progs/commit/38d99b69a842d897cd087658d0a8c1e9d8601cd5) |
 | 2026-11-01 | fixed | RV32I assembly of all four functions | `q_mul` 1.73x, `op3` 1.29x the best C build; fixed passes, total 50/100 | [`2b37892`](https://github.com/PeteChiang1211/arch2026-progs/commit/2b37892bfd17f9d11355b79d7571f58d3afb6fae) |
-| | bf16 | | | |
+| 2026-11-01 | bf16 | C narrowing with round to nearest, ties to even | tests pass, 15 instructions (budget 150) | [`ed6e6f1`](https://github.com/PeteChiang1211/arch2026-progs/commit/ed6e6f12d7d947fef441d4a09342e9f6eb810e3d) |
+| 2026-11-01 | bf16 | C multiply | tests pass, worst call 174 instructions (budget 1,000) | [`16f0557`](https://github.com/PeteChiang1211/arch2026-progs/commit/16f05576e431027ffc8f52b8082e4216149a89c0) |
+| 2026-11-01 | bf16 | C square root by binary search | all C tests pass, worst call 631 instructions (budget 4,000) | [`4592e41`](https://github.com/PeteChiang1211/arch2026-progs/commit/4592e41d049f1d516afc66032aeca8382c539731) |
+| 2026-11-01 | bf16 | RV32I assembly: quarter-square multiply, table square root | multiply 2.01x, square root 18x the best C build; bf16 passes, total 75/100 | [`d9aaf53`](https://github.com/PeteChiang1211/arch2026-progs/commit/d9aaf53c23655c1bd7ba6de7a3b4fd49df5252e6) |
 | | rubik | | | |
 
 ## Environment
@@ -206,7 +209,61 @@ Footprint `.text` (bytes): -O1 380, -O2 360, -O3 360, -Os 372, asm 224.
 
 ## bf16: BFloat16
 
-> TODO
+Contract: [`src/bf16/bf16.h`](https://github.com/PeteChiang1211/arch2026-progs/blob/d9aaf53c23655c1bd7ba6de7a3b4fd49df5252e6/src/bf16/bf16.h). C version: [`src/bf16/bf16.c`](https://github.com/PeteChiang1211/arch2026-progs/blob/d9aaf53c23655c1bd7ba6de7a3b4fd49df5252e6/src/bf16/bf16.c). Assembly: [`src/bf16/bf16.S`](https://github.com/PeteChiang1211/arch2026-progs/blob/d9aaf53c23655c1bd7ba6de7a3b4fd49df5252e6/src/bf16/bf16.S).
+
+### Format
+
+A floating-point number is binary scientific notation: (−1)^s × 1.f × 2^(e − 127).
+
+| | sign | exponent (bias 127) | fraction |
+|---|---|---|---|
+| binary32 | 1 bit | 8 bits | 23 bits |
+| bfloat16 | 1 bit | 8 bits | 7 bits |
+
+bfloat16 is the top half of binary32: the same range (about 10^±38) with 8 bits of precision instead of 24, which is why machine learning hardware uses it. The leading 1 of a normal number is not stored (the hidden bit). Exponent 0xFF encodes infinity (fraction 0) and NaN (fraction nonzero); exponent 0 encodes zero and denormals.
+
+### Narrowing
+
+Taking the top 16 bits truncates. Adding half of the dropped unit first rounds to nearest; adding 0x7FFF plus the lowest kept bit instead of 0x8000 sends an exact tie to the even neighbor, so ties do not bias upward. Infinity and NaN skip the rounding, which could turn a NaN payload into a different value.
+
+```c
+    uint32_t bit16 = (f32bits >> 16) & 1;
+    return (f32bits + 0x7FFF + bit16) >> 16;
+```
+
+### Multiply
+
+Like (2 × 10^3)(3 × 10^4) = 6 × 10^7: the significands (with the hidden bit restored) multiply and the exponents add. The biased exponents each carry +127, so one bias is subtracted. The 8 × 8-bit product of two values in [128, 255] lies in [2^14, 2^16); when it reaches bit 15 it is shifted one more bit and the exponent grows by one, like 20 × 10^5 = 2 × 10^6. The contract truncates the fraction.
+
+The assembly replaces the `__mulsi3` call with the quarter-square identity
+
+x · y = q(x + y) − q(x − y),  q(n) = ⌊n² / 4⌋
+
+which holds exactly for integers because x + y and x − y have the same parity, so both floors drop the same quarter. q(0) … q(510) is a 1,022-byte table that the assembler builds with `.rept`, and the product costs two loads and a subtraction.
+
+### Square root
+
+√(2^e · m) = 2^(e/2) · √m; an odd e lends a factor of two to m, like √(9 × 10^5) = √(90 × 10^4) = √90 × 10^2. The C version follows the contract: a binary search over [90, 256] for the largest mid with mid · mid / 128 ≤ m, eight passes with a multiply each.
+
+The assembly observes that the answer depends only on the 7-bit fraction and the parity of the exponent, 256 cases, that it always lies in [128, 255] (so the renormalization never runs), and that it equals isqrt(128(m + 1) − 1). A 256-byte table holds every answer, and the result exponent is (exp + 127) >> 1 for both parities. [`mytests/bf16_sqrt_table.py`](https://github.com/PeteChiang1211/arch2026-progs/blob/d9aaf53c23655c1bd7ba6de7a3b4fd49df5252e6/mytests/bf16_sqrt_table.py) generates the table and checks each entry against the binary search.
+
+### Results
+
+Instructions per call (`make cycles`):
+
+| Function | -O1 | -O2 | -O3 | -Os | asm | speedup |
+|---|---|---|---|---|---|---|
+| from_f32 | 11.1 | 12.2 | 13.8 | 12.2 | 11.2 | 0.98x |
+| mul | 100.7 | 92.1 | 93.6 | 94.6 | 45.8 | 2.01x |
+| sqrt | 327.6 | 326.1 | 327.6 | 336.3 | 18.1 | 18.06x |
+
+Narrowing ties the compiler: both versions are the same eleven instructions, and the 0.1 difference comes from the caller. It is within the grader's margin of two instructions.
+
+Worst calls (assembly / best C / assembly budget): from_f32 14 / 14 / 60, mul 114 / 174 / 400, sqrt 27 / 622 / 1,500. The worst multiply is a pair of denormals, whose normalization loops shift one bit at a time.
+
+Footprint (bytes): C -O2 `.text` 828; assembly `.text` 508 plus `.rodata` 1,278 (the two tables). The tables trade space for time.
+
+> TODO: error of the square root against a host reference (the contract states 0.3884% at worst); real-world uses of bfloat16.
 
 ## rubik
 
