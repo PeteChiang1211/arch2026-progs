@@ -41,11 +41,13 @@ static int dfs(int g, int bound, int pr, int orank, int s0, int s1, int last)
     return 0;
 }
 
+/* Move names and their lengths, indexed by face * 3 + turn. */
+static const char *const names[9] = {"R",  "R2", "R'", "B", "B2",
+                                     "B'", "D",  "D2", "D'"};
+static const int name_len[9] = {1, 2, 2, 1, 2, 2, 1, 2, 2};
+
 int rubik_solve(const char *state, char *out, size_t cap)
 {
-    (void) out;
-    (void) cap;
-
     /* The state must be exactly 14 characters long. */
     for (int i = 0; i < 14; i++) {
         if (state[i] == '\0')
@@ -114,6 +116,32 @@ int rubik_solve(const char *state, char *out, size_t cap)
     while (!dfs(0, len, pr, orank, s0, s1, -1))
         len = len + 1;
 
-    /* TODO: step 4, the output. */
-    return -1;
+    /* Characters needed: each name, a space between moves, the NUL. */
+    size_t need = 1;
+    for (int i = 0; i < len; i++) {
+        need = need + name_len[path[i]];
+        if (i > 0)
+            need = need + 1;
+    }
+    if (need > cap) {
+        if (cap >= 1)
+            out[0] = '\0';
+        return -2;
+    }
+
+    /* Copy the names, separated by single spaces. */
+    int w = 0;
+    for (int i = 0; i < len; i++) {
+        if (i > 0) {
+            out[w] = ' ';
+            w = w + 1;
+        }
+        const char *name = names[path[i]];
+        for (int k = 0; k < name_len[path[i]]; k++) {
+            out[w] = name[k];
+            w = w + 1;
+        }
+    }
+    out[w] = '\0';
+    return len;
 }
