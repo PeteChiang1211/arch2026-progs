@@ -281,9 +281,48 @@ int main(void)
             "    .section .rodata\n\n");
     s_array(s, "rubik_perm_move", perm_move, 3 * PERMS, 1);
     s_array(s, "rubik_orient_move", orient_move, 3 * ORIENTS, 1);
-    s_array(s, "rubik_cubie_move", cubie_move, 3 * 28, 0);
-    s_array(s, "rubik_pattern_dist", pattern_dist, PERMS * 9, 0);
-    s_array(s, "rubik_orient_pos_dist", orient_pos_dist, ORIENTS * 49, 0);
+
+    /* The assembly stores both distance tables transposed, so that a row
+     * address depends only on corners 0 and 1 and the column is the plain
+     * rank: pdist_t[(t0 * 3 + t1) * 5040 + p], odist_t[(q0 * 7 + q1) * 729
+     * + o]. No index needs a multiply in the search loop.
+     */
+    static uint8_t pdist_t[PERMS * 9], odist_t[ORIENTS * 49];
+    for (int p = 0; p < PERMS; p++)
+        for (int k = 0; k < 9; k++)
+            pdist_t[k * PERMS + p] = pattern_dist[p * 9 + k];
+    for (int o = 0; o < ORIENTS; o++)
+        for (int k = 0; k < 49; k++)
+            odist_t[k * ORIENTS + o] = orient_pos_dist[o * 49 + k];
+    s_array(s, "rubik_pdist_t", pdist_t, PERMS * 9, 0);
+    s_array(s, "rubik_odist_t", odist_t, ORIENTS * 49, 0);
+
+    /* One 20-byte record per pair of coordinates of corners 0 and 1, with
+     * id = (q0 * 7 + q1) * 9 + t0 * 3 + t1 (q a position, t a twist):
+     *   word 0  address of the pdist_t row of (t0, t1)
+     *   word 1  address of the odist_t row of (q0, q1)
+     *   word 2, 3, 4  address of the record after a quarter turn of R, B, D
+     * The 49 records with q0 == q1 are never reached and point to
+     * themselves.
+     */
+    fprintf(s, "    .globl  rubik_pairs\n    .align  2\nrubik_pairs:\n");
+    for (int id = 0; id < 441; id++) {
+        int q0 = id / 63, q1 = id / 9 % 7, t0 = id / 3 % 3, t1 = id % 3;
+        int next[3];
+        for (int f = 0; f < 3; f++) {
+            if (q0 == q1) {
+                next[f] = id;
+                continue;
+            }
+            int a = cubie_move[f][q0 * 4 + t0], b = cubie_move[f][q1 * 4 + t1];
+            next[f] = ((a >> 2) * 7 + (b >> 2)) * 9 + (a & 3) * 3 + (b & 3);
+        }
+        fprintf(s,
+                "    .word   rubik_pdist_t + %d, rubik_odist_t + %d, "
+                "rubik_pairs + %d, rubik_pairs + %d, rubik_pairs + %d\n",
+                (t0 * 3 + t1) * PERMS, (q0 * 7 + q1) * ORIENTS, next[0] * 20,
+                next[1] * 20, next[2] * 20);
+    }
     fclose(s);
     return 0;
 }
