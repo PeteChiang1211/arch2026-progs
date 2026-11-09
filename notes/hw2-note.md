@@ -19,7 +19,12 @@ Repository: [PeteChiang1211/arch2026-progs](https://github.com/PeteChiang1211/ar
 | 2026-11-01 | bf16 | C multiply | tests pass, worst call 174 instructions (budget 1,000) | [`16f0557`](https://github.com/PeteChiang1211/arch2026-progs/commit/16f05576e431027ffc8f52b8082e4216149a89c0) |
 | 2026-11-01 | bf16 | C square root by binary search | all C tests pass, worst call 631 instructions (budget 4,000) | [`4592e41`](https://github.com/PeteChiang1211/arch2026-progs/commit/4592e41d049f1d516afc66032aeca8382c539731) |
 | 2026-11-01 | bf16 | RV32I assembly: quarter-square multiply, table square root | multiply 2.01x, square root 18x the best C build; bf16 passes, total 75/100 | [`d9aaf53`](https://github.com/PeteChiang1211/arch2026-progs/commit/d9aaf53c23655c1bd7ba6de7a3b4fd49df5252e6) |
-| | rubik | | | |
+| 2026-11-04 | rubik | Host generator of the search tables; second lower bound pairs the orientations with the positions of corners 0 and 1 | hardest state: 157,239 → 88,899 search nodes; tables 115,784 bytes (budget 131,072) | [`745985a`](https://github.com/PeteChiang1211/arch2026-progs/commit/745985aabb1d0e3aaf23b91f3f2c737533cea1cc) |
+| 2026-11-05 | rubik | C input validation | invalid states return -1 | [`d4a37b2`](https://github.com/PeteChiang1211/arch2026-progs/commit/d4a37b2048e8be62299b267f2768379a1d4d05e6) |
+| 2026-11-05 | rubik | C ranks of the state | permutation, orientation and corner coordinates | [`79e1651`](https://github.com/PeteChiang1211/arch2026-progs/commit/79e165194c6c593dce28437d62186e0301ba2867) |
+| 2026-11-09 | rubik | C iterative deepening search | recursive depth-first search with a move limit | [`a165d11`](https://github.com/PeteChiang1211/arch2026-progs/commit/a165d112bbf132706470cd2243ba4d431eb818d3) |
+| 2026-11-09 | rubik | C solution text | all C tests pass; hardest state 7.67 million instructions at `-O2` (budget 50 million) | [`2889082`](https://github.com/PeteChiang1211/arch2026-progs/commit/2889082c8f0908dc2462c334367447cc6d013242) |
+| 2026-11-09 | rubik | RV32I assembly: pair records, transposed tables, children tested before entry | hardest state 2.73 million (budget 7.5 million), 2.39x the best C build; total 100/100 | [`5442d5a`](https://github.com/PeteChiang1211/arch2026-progs/commit/5442d5a1c0851bc8c43272a883b21e9539fbd64c) |
 
 ## Environment
 
@@ -265,6 +270,138 @@ Footprint (bytes): C -O2 `.text` 828; assembly `.text` 508 plus `.rodata` 1,278 
 
 > TODO: error of the square root against a host reference (the contract states 0.3884% at worst); real-world uses of bfloat16.
 
-## rubik
+## rubik: Optimal 2×2×2 solver
 
-> TODO
+Contract: [`src/rubik/rubik.h`](https://github.com/PeteChiang1211/arch2026-progs/blob/5442d5a1c0851bc8c43272a883b21e9539fbd64c/src/rubik/rubik.h). C version: [`src/rubik/rubik.c`](https://github.com/PeteChiang1211/arch2026-progs/blob/5442d5a1c0851bc8c43272a883b21e9539fbd64c/src/rubik/rubik.c). Assembly: [`src/rubik/rubik.S`](https://github.com/PeteChiang1211/arch2026-progs/blob/5442d5a1c0851bc8c43272a883b21e9539fbd64c/src/rubik/rubik.S). Table generator: [`mytests/rubik_tables.c`](https://github.com/PeteChiang1211/arch2026-progs/blob/5442d5a1c0851bc8c43272a883b21e9539fbd64c/mytests/rubik_tables.c).
+
+`rubik_solve(state, out, cap)` reads a 14-character state (seven corner digits, seven twist digits), writes a shortest solution such as `"R2 D B'"` and returns its length; it returns -1 for an invalid state and -2 when the text does not fit in `cap` bytes.
+
+### From Homework 1 to bare metal
+
+Homework 1 had two solvers. `solver.c` ran a breadth-first search over all 3,674,160 states and kept one move per state (about 18 MB), which the contract rejects and the 128 KiB data budget rules out. `ida.c` used iterative deepening A\* (IDA\*) with distance tables as lower bounds; that is the algorithm ported here. The environment changes the rest:
+
+| | Homework 1 | Assignment 2 |
+|---|---|---|
+| Runs on | host and Ripes | rv32emu, bare metal, 4 KiB stack |
+| Interface | command line, `printf` | `rubik_solve(state, out, cap)`, return codes -1 and -2 |
+| Tables | built when the program starts | built on the host, linked as read-only data |
+| Limits | none | 128 KiB of data; 50 million (C) and 7.5 million (assembly) instructions per call |
+| Instructions | Ripes allows `mul` and `div` | RV32I only |
+
+Building the tables on the target would cost millions of instructions inside the measured call, so a host program generates them and the target only reads them.
+
+### Principle: IDA\*
+
+A state is a node and each of the nine moves (R, R2, R', B, B2, B', D, D2, D') an edge. Iterative deepening runs a depth-first search with a move limit of 0, 1, 2, … and stops at the first limit that succeeds, so the solution is shortest. A depth-first search keeps only the current path, so its memory is a few frames instead of a table of all states.
+
+The search gives up on a branch early with a lower bound h of the moves still needed: after g moves under a limit of `bound`, if g + h > bound no solution within the limit passes through this node. h = 0 only for the solved state. Two more rules cut the tree: a face is never turned twice in a row (R then R2 is R', one move), and the three turns of a face are one, two and three quarter turns, so each costs one table lookup from the previous one.
+
+### Mathematical foundation
+
+With corner 0 fixed in place, a state is a permutation of the other seven corners and their twists:
+
+- **Permutation rank** p ∈ [0, 5040): the Lehmer code, where position i counts the smaller corners to its right, weighted by (6 − i)!. It is the position of the permutation in lexicographic order.
+- **Orientation rank** o ∈ [0, 729): the first six twists as a base-3 number. Every quarter turn changes the twists by a multiple of 3 in total, so the seventh twist follows from the other six; an input whose twists do not sum to a multiple of 3 cannot be reached and is invalid.
+- **Corners 0 and 1**: position × 4 + twist of each.
+
+7! × 3^6 = 3,674,160 states. A quarter turn maps each coordinate independently, so `perm_move`, `orient_move` and `cubie_move` turn a state with table lookups.
+
+The two lower bounds are distances in simplified puzzles. `pattern_dist[p][t0, t1]` is the fewest moves that solve the permutation together with the twists of corners 0 and 1, the minimum over the states that share them, so it never exceeds the true distance. `orient_pos_dist[o][q0, q1]` does the same for the orientations together with the positions of corners 0 and 1. The heuristic is their maximum, still a lower bound, so IDA\* stays optimal.
+
+Homework 1 used the orientations alone as the second bound. Telling corners 0 and 1 apart raises it, and the hardest state at distance 11 drops from 157,239 to 88,899 search nodes (counted on the host over all 2,644 states at distance 11). The new table is never below the old one, so the old one is not needed.
+
+### C version
+
+The search is a recursive depth-first search; `last` is the face of the previous move, -1 at the root.
+
+```c
+static int dfs(int g, int bound, int pr, int orank, int s0, int s1, int last)
+{
+    int h = pattern_dist[pr * 9 + (s0 & 3) * 3 + (s1 & 3)];
+    int h2 = orient_pos_dist[orank * 49 + (s0 >> 2) * 7 + (s1 >> 2)];
+    if (h2 > h)
+        h = h2;
+    if (g + h > bound)
+        return 0;
+    if (h == 0)
+        return 1;
+    for (int face = 0; face < 3; face++) {
+        if (face == last)
+            continue;
+        ...
+```
+
+The caller raises the limit one move at a time:
+
+```c
+    int len = 0;
+    while (!dfs(0, len, pr, orank, s0, s1, -1))
+        len = len + 1;
+```
+
+The twist sum modulo 3 is found by repeated subtraction, because `%` would call a divide routine the runtime does not have.
+
+### Assembly version
+
+The assembly runs the same search with the same bounds, so it visits the same nodes; the gain is fewer instructions per node.
+
+1. **Pair records.** Corners 0 and 1 together have 441 coordinate pairs. Each gets a 20-byte record holding the addresses of its rows of both distance tables and of the records after a quarter turn of R, B and D, so turning the pair is one `lw`.
+2. **Transposed tables.** The tables are stored as `pdist_t[(t0 · 3 + t1) · 5040 + p]` and `odist_t[(q0 · 7 + q1) · 729 + o]`. The row address comes from the record and the column is the plain rank, so the index needs no multiply.
+3. **Children tested before entry.** The C version enters a child and then finds it pruned. The assembly computes the child's bound in the parent's loop and enters only a child that passes; a pruned child, the common case, costs no stores.
+4. **No calls.** The recursion is a loop over 32-byte frames in `.bss`, one per depth, and only a child that is entered saves its parent's loop state.
+
+One node of the inner loop:
+
+```asm
+turn_loop:                          # one more quarter turn of this face
+    slli    t0, s9, 1
+    add     t0, t0, s6
+    lhu     s9, 0(t0)               # permutation rank
+    slli    t0, s10, 1
+    add     t0, t0, s7
+    lhu     s10, 0(t0)              # orientation rank
+    add     t0, s11, s8
+    lw      s11, 0(t0)              # corners 0 and 1: one load
+    lw      t1, 0(s11)              # h = max of the two lower bounds
+    add     t1, t1, s9
+    lbu     t1, 0(t1)
+    lw      t2, 4(s11)
+    add     t2, t2, s10
+    lbu     t2, 0(t2)
+    bgeu    t1, t2, turn_h
+    mv      t1, t2
+turn_h:
+    beqz    t1, found               # the child is solved
+    blt     t1, s4, descend         # it can be solved within the limit
+```
+
+### Results
+
+Hardest state at distance 11 (`54721631111111`), instructions for one call:
+
+| -O1 | -O2 | -O3 | -Os | asm |
+|---|---|---|---|---|
+| 7,578,622 | 7,667,412 | 7,609,475 | 7,563,955 | **2,732,989** |
+
+Budgets: 50 million for C, 7.5 million for assembly.
+
+Instructions per call over the benchmark states (distances 0 to 9, `make cycles`):
+
+| -O1 | -O2 | -O3 | -Os | asm | speedup |
+|---|---|---|---|---|---|
+| 29,992.2 | 30,274.0 | 26,366.2 | 30,130.2 | 11,034.5 | 2.39x |
+
+Footprint (`size -A`, bytes; budget 131,072 for all allocated sections):
+
+| | `.text` | `.rodata` | `.bss` |
+|---|---|---|---|
+| C -O2 | 1,520 | 115,919 | 48 |
+| assembly | 1,108 | 124,560 | 416 |
+
+The assembly carries 8,820 bytes of pair records more than the C tables, and its frames live in `.bss` instead of on the stack.
+
+### Verification
+
+`tests/trubik.c` runs both versions on 59 states from distance 0 to 11, checking that the text parses, that applying it solves the cube, and that its length equals the exact distance; on all nine single moves, an 11-move chain, 13 invalid states, and every buffer size around the exact fit. It rebuilds the cube model from the face tables, so it never trusts the solver. All tests pass at `-O1`, `-O2`, `-O3` and `-Os`, the C version passes the host sanitizers, and the generator checks that the new lower bound is never below the orientation-only distance.
+
+> TODO: why the -O3 build is the fastest C build here; real-world uses of IDA\* and pattern databases (puzzle solvers, route planning).
